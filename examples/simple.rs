@@ -1,30 +1,17 @@
-use bevy::{
-    prelude::*,
-    render::settings::{Backends, WgpuSettings},
-};
-use bevy_egui::{EguiContext, EguiPlugin};
-use bevy_inspector_egui::{
-    egui::{self, Ui},
-    quick::WorldInspectorPlugin,
-};
+use bevy::prelude::*;
+use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use bevy_tilt_five::{
-    AvailableGlasses, BoardBundle, DebugGizmo, GlassesInfo, TiltFiveClientEvent, TiltFiveCommands,
-    TiltFivePlugin,
+    AvailableGlasses, BoardBundle, CameraStreamPlugin, GlassesInfo, TiltFiveClientEvent,
+    TiltFiveCommand, TiltFivePlugin, WandPlugin,
 };
 
 fn main() {
     App::new()
-        .insert_resource(WgpuSettings {
-            backends: Some(Backends::DX12),
-            ..Default::default()
-        })
         .insert_resource(ClearColor(Color::BLACK))
         .add_plugins(DefaultPlugins)
-        .add_plugin(EguiPlugin)
-        .add_plugin(TiltFivePlugin)
-        .add_startup_system(setup)
-        .add_system(connect_glasses)
-        .add_plugin(WorldInspectorPlugin)
+        .add_plugins((EguiPlugin, TiltFivePlugin, WandPlugin, CameraStreamPlugin))
+        .add_systems(Startup, setup)
+        .add_systems(Update, ui)
         .run();
 }
 
@@ -33,138 +20,73 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // plane
+    // Floor
     commands.spawn(PbrBundle {
-        mesh: meshes.add(Mesh::from(shape::Plane { size: 5.0 })),
-        material: materials.add(Color::rgb(0.6, 0.9, 0.5).into()),
+        mesh: meshes.add(Plane3d::default().mesh().size(5.0, 5.0)),
+        material: materials.add(Color::srgb(0.6, 0.9, 0.5)),
         ..default()
     });
 
-    // Gizmo
-    commands.spawn((
-        SpatialBundle::from_transform(Transform::from_scale(0.2 * Vec3::ONE)),
-        DebugGizmo(Color::RED),
-    ));
-
-    // light
+    // Light
     commands.spawn(PointLightBundle {
         point_light: PointLight {
-            intensity: 1500.0,
+            intensity: 1_000_000.0,
             shadows_enabled: true,
             ..default()
         },
         transform: Transform::from_xyz(4.0, 8.0, 4.0),
         ..default()
     });
-    // camera
+
+    // Observer camera (for the main monitor window)
     commands.spawn(Camera3dBundle {
         transform: Transform::from_xyz(-2.0, 2.5, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
         ..default()
     });
 
-    commands.spawn(BoardBundle {
-        ..Default::default()
-    });
+    // Tilt Five gameboard. Setting the Transform here rotates the whole
+    // Tilt Five scene — e.g. `with_rotation(Quat::from_rotation_y(0.5))` to
+    // yaw the board 29°.
+    commands.spawn(BoardBundle::default());
 }
 
-fn connect_glasses(
-    mut egui_context: ResMut<EguiContext>,
-    mut events: EventWriter<TiltFiveCommands>,
+fn ui(
+    mut egui_context: EguiContexts,
+    mut events: EventWriter<TiltFiveCommand>,
     mut read_events: EventReader<TiltFiveClientEvent>,
     glasses: Res<AvailableGlasses>,
 ) {
-    let connected_glasses = glasses
-        .glasses
-        .iter()
-        .filter_map(|(name, val)| {
-            if let GlassesInfo::Connected {
-                entity: _,
-                left,
-                right,
-                friendly_name,
-            } = val
-            {
-                let label = if let Some(label) = friendly_name.as_ref() {
-                    label.as_str()
-                } else {
-                    Into::<&str>::into(name)
-                };
-                Some((
-                    name,
-                    (
-                        egui_context.add_image(left.clone_weak()),
-                        egui_context.add_image(right.clone_weak()),
-                    ),
-                    label,
-                ))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
     let ctx = egui_context.ctx_mut();
     egui::Window::new("T5 Status").show(ctx, |ui| {
         ui.label("Available Glasses:");
         for (key, val) in glasses.glasses.iter() {
-            let label = Into::<&str>::into(key);
+            let label: &str = key.into();
             if val.is_disconnected() && ui.button(label).clicked() {
-                events.send(TiltFiveCommands::ConnectToGlasses(key.clone()));
+                events.send(TiltFiveCommand::ConnectToGlasses(key.clone()));
             }
         }
-        ui.label("Connected Glasses:");
-        for (key, images, label) in connected_glasses.iter() {
-            let (left, right) = images;
-            ui.label(*label);
 
-            if ui.button("Disconnect...").clicked() {
-                events.send(TiltFiveCommands::DisconnectFromGlasses(
-                    key.to_owned().clone(),
-                ));
+        ui.separator();
+        ui.label("Connected:");
+        for (key, info) in glasses.glasses.iter() {
+            if let GlassesInfo::Connected { friendly_name, .. } = info {
+                let name = friendly_name.clone().unwrap_or_else(|| key.to_string());
+                ui.label(name);
+                if ui.button("Disconnect").clicked() {
+                    events.send(TiltFiveCommand::DisconnectFromGlasses(key.clone()));
+                }
             }
-
-            ui.horizontal(|ui| {
-                ui.label("left");
-                ui.image(*left, [121.6, 76.8]);
-                ui.label("right");
-                ui.image(*right, [121.6, 76.8]);
-            });
         }
+
+        ui.separator();
         if ui.button("Refresh List").clicked() {
-            events.send(TiltFiveCommands::RefreshGlassesList);
+            events.send(TiltFiveCommand::RefreshGlassesList);
         }
 
-        for evt in read_events.iter() {
-            if let TiltFiveClientEvent::GlassesPoseChanged(_, t, _, o) = evt {
-                let t_p = t.translation;
-                let t_r = t.rotation;
-                let o_p = o.translation;
-                let o_r = o.rotation;
-                ui.label("Current Position:");
-                display_vec3(ui, &t_p, 1.);
-                ui.label("Org Position:");
-                display_vec3(ui, &o_p, 1.);
-
-                ui.label("Current Rotation:");
-                display_rotation(ui, &t_r);
-                ui.label("Org Rotation:");
-                display_rotation(ui, &o_r);
+        for evt in read_events.read() {
+            if let TiltFiveClientEvent::Error(msg) = evt {
+                ui.colored_label(egui::Color32::RED, msg);
             }
         }
-    });
-}
-
-fn display_rotation(ui: &mut Ui, rotation: &Quat) {
-    let rot = rotation.to_euler(EulerRot::XYZ);
-    display_vec3(ui, &Vec3::new(rot.0, rot.1, rot.2), 1f32.to_degrees());
-}
-
-fn display_vec3(ui: &mut Ui, vec: &Vec3, scale_by: f32) {
-    ui.horizontal(|ui| {
-        ui.label("X: ");
-        ui.label(format!("{:05.2}", vec.x * scale_by));
-        ui.label(" Y: ");
-        ui.label(format!("{:05.2}", vec.y * scale_by));
-        ui.label("Z: ");
-        ui.label(format!("{:05.2}", vec.z * scale_by));
     });
 }
